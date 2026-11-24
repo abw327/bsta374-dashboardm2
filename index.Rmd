@@ -1,0 +1,430 @@
+---
+title: "M2 Dashboard"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: cosmo
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(sf)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(plotly)
+library(leaflet)
+library(DT)
+library(tigris)
+
+options(tigris_use_cache = TRUE)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+
+# Data: one row per state and year
+us <- read_csv(
+  "~/US_Cancer_Incidence.csv",
+  col_types = cols(
+    `State Code` = col_character()
+  )
+) |>
+  transmute(
+    State = State,
+    GEOID = `State Code`,
+    Year = as.integer(Year),
+    Cases = as.numeric(Count),
+    Population = as.numeric(Population),
+    Crude_Rate = as.numeric(`Crude Rate`)
+  ) |>
+  filter(
+    !is.na(State),
+    !is.na(GEOID),
+    !is.na(Year),
+    !is.na(Cases),
+    !is.na(Population),
+    Population > 0
+  )
+
+# State boundaries
+us_map <- states(
+  cb = TRUE,
+  year = 2020,
+  progress_bar = FALSE
+) |>
+  st_transform(4326) |>
+  transmute(
+    GEOID = STATEFP,
+    NAME = NAME,
+    geometry = geometry
+  ) |>
+  filter(GEOID %in% unique(us$GEOID)) |>
+  arrange(GEOID)
+
+# Keep only states that appear in both the data and boundaries
+valid_states <- intersect(
+  unique(us$GEOID),
+  unique(us_map$GEOID)
+)
+
+us <- us |>
+  filter(GEOID %in% valid_states)
+
+us_map <- us_map |>
+  filter(GEOID %in% valid_states)
+
+# U.S. trend: one row per year
+# Rate uses total cases divided by total person-years
+us_year <- us |>
+  group_by(Year) |>
+  summarise(
+    Cases = sum(Cases, na.rm = TRUE),
+    Population = sum(Population, na.rm = TRUE),
+    Rate = 100000 * Cases / Population,
+    .groups = "drop"
+  )
+
+# State-period rates used only to establish fixed map classes
+state_period <- us |>
+  group_by(GEOID, State) |>
+  summarise(
+    Cases = sum(Cases, na.rm = TRUE),
+    Population = sum(Population, na.rm = TRUE),
+    Rate = 100000 * Cases / Population,
+    .groups = "drop"
+  )
+
+# Fixed map classes: calculated once in the setup chunk
+rate_breaks <- pretty(
+  range(state_period$Rate, na.rm = TRUE),
+  n = 7
+)
+
+# Ensure the full data range is included
+rate_breaks[1] <- min(
+  rate_breaks[1],
+  min(state_period$Rate, na.rm = TRUE)
+)
+
+rate_breaks[length(rate_breaks)] <- max(
+  rate_breaks[length(rate_breaks)],
+  max(state_period$Rate, na.rm = TRUE)
+)
+```
+
+Column {.sidebar data-width=260}
+-----------------------------------------------------------------------
+
+```{r inputs}
+selectInput(
+  "state",
+  "State",
+  choices = sort(unique(us$State)),
+  selected = "Pennsylvania"
+)
+
+sliderInput(
+  "years",
+  "Years",
+  min = min(us$Year, na.rm = TRUE),
+  max = max(us$Year, na.rm = TRUE),
+  value = range(us$Year, na.rm = TRUE),
+  step = 1,
+  sep = ""
+)
+```
+
+Pick a state, then drag either end of the slider. The map, the time
+series and the table follow.
+
+### About this data
+
+- **Outcome:** Reported lung and bronchus cancer cases across U.S. states from 1999-2022.
+- **Population at risk:** Residents of each U.S. state during the selected years.
+- **Expected counts:** Lung and bronchus cancer incidence measured as the crude rate per 100,000 population.
+- **Source:** CDC WONDER United States Cancer Statistics (USCS) database, 1999–2022 Incidence Data; state boundaries obtained from the U.S. Census Bureau via the `tigris` package.
+- **Areas without data:** none.
+- **Limitation:** Rates displayed are crude incidence rates and are not age-adjusted. Differences among states may reflect variations in population age structure, smoking prevalence, environmental exposures, healthcare access, and other demographic factors in addition to differences in lung and bronchus cancer incidence.
+
+```{r reactive}
+by_state <- reactive({
+  req(input$years)
+
+  us |>
+    filter(
+      between(
+        Year,
+        input$years[1],
+        input$years[2]
+      )
+    ) |>
+    group_by(GEOID, State) |>
+    summarise(
+      Cases = sum(Cases, na.rm = TRUE),
+      Population = sum(Population, na.rm = TRUE),
+      Rate = 100000 * Cases / Population,
+      .groups = "drop"
+    )
+})
+```
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### Cancer incidence rate by state
+
+```{r map}
+renderLeaflet({
+  req(input$state, input$years)
+
+  d <- us_map |>
+    left_join(
+      by_state(),
+      by = "GEOID"
+    )
+
+  validate(
+    need(
+      any(!is.na(d$Rate)),
+      "No data is available for the selected period."
+    )
+  )
+
+  pal <- colorBin(
+    palette = "Reds",
+    domain = state_period$Rate,
+    bins = rate_breaks,
+    na.color = "#D9D9D9"
+  )
+
+  selected_map <- d |>
+    filter(NAME == input$state)
+
+  m <- leaflet(d) |>
+    addProviderTiles(
+      providers$CartoDB.Positron,
+      options = providerTileOptions(opacity = 0.6)
+    ) |>
+    addPolygons(
+      fillColor = ~pal(Rate),
+      fillOpacity = 0.8,
+      color = "white",
+      weight = 1,
+      label = ~ifelse(
+        is.na(Rate),
+        paste0(NAME, ": no data"),
+        sprintf(
+          "%s<br>Cases: %s<br>Population: %s<br>Rate: %.1f per 100,000",
+          NAME,
+          format(Cases, big.mark = ",", scientific = FALSE),
+          format(Population, big.mark = ",", scientific = FALSE),
+          Rate
+        )
+      ),
+      highlightOptions = highlightOptions(
+        weight = 2,
+        color = "black",
+        bringToFront = TRUE
+      )
+    ) |>
+    addLegend(
+      position = "bottomright",
+      pal = pal,
+      values = state_period$Rate,
+      title = paste0(
+        "Rate per 100,000<br>",
+        input$years[1],
+        "–",
+        input$years[2]
+      ),
+      labFormat = labelFormat(digits = 1),
+      opacity = 0.8
+    )
+
+  if (nrow(selected_map) == 1) {
+    m <- m |>
+      addPolygons(
+        data = selected_map,
+        fill = FALSE,
+        color = "black",
+        weight = 3,
+        group = "Selected state"
+      )
+  }
+
+  m
+})
+```
+
+> Rates represent cases per 100,000 person-years for the selected period.
+> The selected state is outlined in black. Map classes remain fixed when the
+> year range changes, allowing colors to be compared across selections.
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Selected state and period
+
+```{r box-state}
+renderValueBox({
+  req(input$state, input$years)
+
+  one <- by_state() |>
+    filter(State == input$state)
+
+  validate(
+    need(
+      nrow(one) == 1,
+      "No data are available for this state and period."
+    )
+  )
+
+  valueBox(
+    value = sprintf("%.1f", one$Rate),
+    caption = paste0(
+      input$state,
+      ": cases per 100,000, ",
+      input$years[1],
+      "–",
+      input$years[2]
+    ),
+    icon = "fa-chart-line",
+    color = "primary"
+  )
+})
+```
+
+### Cancer incidence rate by year
+
+```{r timeseries}
+renderPlotly({
+  req(input$state, input$years)
+
+  one_state <- us |>
+    filter(State == input$state) |>
+    group_by(Year) |>
+    summarise(
+      Cases = sum(Cases, na.rm = TRUE),
+      Population = sum(Population, na.rm = TRUE),
+      Rate = 100000 * Cases / Population,
+      .groups = "drop"
+    ) |>
+    mutate(Area = input$state)
+
+  trend_data <- bind_rows(
+    us_year |>
+      transmute(
+        Year,
+        Cases,
+        Population,
+        Rate,
+        Area = "United States"
+      ),
+    one_state
+  )
+
+  colors <- setNames(
+    c("black", "#B2182B"),
+    c("United States", input$state)
+  )
+
+  p <- ggplot(
+    trend_data,
+    aes(
+      x = Year,
+      y = Rate,
+      color = Area,
+      group = Area,
+      text = paste0(
+        "Area: ", Area,
+        "<br>Year: ", Year,
+        "<br>Rate: ", sprintf("%.1f", Rate),
+        "<br>Cases: ", format(Cases, big.mark = ",")
+      )
+    )
+  ) +
+    annotate(
+      "rect",
+      xmin = input$years[1] - 0.5,
+      xmax = input$years[2] + 0.5,
+      ymin = -Inf,
+      ymax = Inf,
+      fill = "grey80",
+      alpha = 0.5
+    ) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = colors) +
+    labs(
+      x = NULL,
+      y = "Cases per 100,000",
+      color = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom"
+    )
+
+  ggplotly(
+    p,
+    tooltip = "text"
+  )
+})
+```
+
+> The gray band marks the years currently selected with the slider.
+
+### States during the selected period
+
+```{r table}
+renderDT({
+  req(input$state, input$years)
+
+  table_data <- by_state() |>
+    transmute(
+      State,
+      Cases,
+      Population,
+      `Rate per 100,000` = round(Rate, 1)
+    ) |>
+    arrange(desc(`Rate per 100,000`))
+
+  datatable(
+    table_data,
+    rownames = FALSE,
+    options = list(
+      pageLength = 8,
+      dom = "ftp"
+    )
+  ) |>
+    formatCurrency(
+      columns = c("Cases", "Population"),
+      currency = "",
+      interval = 3,
+      mark = ",",
+      digits = 0
+    ) |>
+    formatStyle(
+      "State",
+      target = "row",
+      fontWeight = styleEqual(
+        input$state,
+        "bold"
+      ),
+      backgroundColor = styleEqual(
+        input$state,
+        "#FFF2CC"
+      )
+    )
+})
+```
+
+
+**I was having issues with the difference between using Year and years regarding my data. My dashboard kept knitting incorrectly due to this. AI helped me debug this issue and helped me distinguish which parts I should use Year vs years.**
